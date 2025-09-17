@@ -1,8 +1,10 @@
 import React, { useState, useCallback } from 'react';
 import { UploadedImage, EditedImageResult } from './types';
-import { editImageWithGemini } from './services/geminiService';
+import { editImageWithGemini, getInitializationError } from './services/geminiService';
 import ImageUploader from './components/ImageUploader';
-import { WandIcon, Spinner } from './components/IconDefs';
+import { WandIcon, Spinner, DownloadIcon } from './components/IconDefs';
+
+declare var JSZip: any;
 
 const Header = () => (
   <header className="text-center p-6 md:p-8">
@@ -22,44 +24,98 @@ const ImageCard: React.FC<{ title: string; imageUrl: string }> = ({ title, image
   </div>
 );
 
-const ResultPlaceholder: React.FC<{ isLoading: boolean; text?: string }> = ({ isLoading, text }) => (
-  <div className="bg-dark-card rounded-lg border border-dark-border shadow-lg flex flex-col items-center justify-center aspect-square p-4">
-    {isLoading ? (
-      <>
-        <Spinner />
-        <p className="mt-4 text-medium-text text-center">AI is working its magic...</p>
-        <p className="mt-2 text-sm text-gray-500 text-center">This can take a moment.</p>
-      </>
-    ) : (
-      <>
-        <div className="w-16 h-16 bg-gray-900/50 rounded-full flex items-center justify-center mb-4">
-          <WandIcon />
-        </div>
-        <h3 className="text-center font-semibold text-light-text">Edited Image</h3>
-        <p className="text-medium-text text-center text-sm mt-2">{text || 'Your edited image will appear here.'}</p>
-      </>
-    )}
-  </div>
+const ResultsPanel: React.FC<{ results: EditedImageResult[], isLoading: boolean }> = ({ results, isLoading }) => (
+    <div className="relative bg-dark-card rounded-lg border border-dark-border shadow-lg flex flex-col aspect-square">
+        {isLoading && (
+            <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center z-10 rounded-lg transition-opacity duration-300">
+                <Spinner />
+                <p className="mt-4 text-light-text text-center">AI is working its magic...</p>
+                <p className="mt-2 text-sm text-gray-500 text-center">This can take a moment.</p>
+            </div>
+        )}
+        {results.length === 0 && !isLoading ? (
+            <div className="flex-grow flex flex-col items-center justify-center p-4">
+                <div className="w-16 h-16 bg-gray-900/50 rounded-full flex items-center justify-center mb-4">
+                    <WandIcon />
+                </div>
+                <h3 className="text-center font-semibold text-light-text">Edited Images</h3>
+                <p className="text-medium-text text-center text-sm mt-2">Your edited images will appear here.</p>
+            </div>
+        ) : (
+            <div className="p-2 space-y-4 overflow-y-auto h-full">
+                {results.slice().reverse().map((result, index) => (
+                    <div key={results.length - 1 - index} className="p-2 bg-gray-900/50 rounded-lg">
+                        <img src={result.imageUrl} alt={`Edit ${results.length - index}`} className="w-full h-auto object-contain rounded-md" />
+                        {result.text && <p className="text-center text-medium-text text-xs italic mt-2 p-2">{result.text}</p>}
+                    </div>
+                ))}
+            </div>
+        )}
+    </div>
 );
+
 
 const App: React.FC = () => {
   const [originalImage, setOriginalImage] = useState<UploadedImage | null>(null);
   const [prompt, setPrompt] = useState<string>('');
-  const [editedResult, setEditedResult] = useState<EditedImageResult | null>(null);
+  const [editedResults, setEditedResults] = useState<EditedImageResult[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(getInitializationError());
   
   const handleImageUpload = useCallback((image: UploadedImage) => {
     setOriginalImage(image);
-    setEditedResult(null);
+    setEditedResults([]);
     setError(null);
   }, []);
 
   const handleNewUpload = () => {
     setOriginalImage(null);
-    setEditedResult(null);
+    setEditedResults([]);
     setPrompt('');
-    setError(null);
+    setError(getInitializationError());
+  };
+
+  const sanitizeFilename = (name: string) => name.replace(/[^a-z0-9_.-]/gi, '_').substring(0, 50);
+
+  const handleDownloadAll = async () => {
+      if (!originalImage || editedResults.length === 0) {
+          setError("No images to download.");
+          return;
+      }
+      if (typeof JSZip === 'undefined') {
+          setError("Could not find the JSZip library. Download failed.");
+          return;
+      }
+
+      setIsLoading(true);
+      setError(null);
+      try {
+          const zip = new JSZip();
+
+          const originalExt = originalImage.mimeType.split('/')[1] || 'png';
+          const originalBlob = await (await fetch(originalImage.dataUrl)).blob();
+          zip.file(`original.${originalExt}`, originalBlob);
+
+          const downloadPromises = editedResults.map(async (result, index) => {
+              const resultBlob = await (await fetch(result.imageUrl)).blob();
+              const promptPart = result.prompt ? sanitizeFilename(result.prompt) : `edit_${index + 1}`;
+              zip.file(`edit_${index + 1}_${promptPart}.png`, resultBlob);
+          });
+          await Promise.all(downloadPromises);
+          
+          const content = await zip.generateAsync({ type: "blob" });
+          const link = document.createElement("a");
+          link.href = URL.createObjectURL(content);
+          link.download = "ai_photo_studio_edits.zip";
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+
+      } catch (err) {
+          setError(err instanceof Error ? `Download failed: ${err.message}` : "An unknown error occurred during download.");
+      } finally {
+          setIsLoading(false);
+      }
   };
   
   const handleSubmit = async () => {
@@ -69,11 +125,10 @@ const App: React.FC = () => {
     }
     setError(null);
     setIsLoading(true);
-    setEditedResult(null);
 
     try {
       const result = await editImageWithGemini(originalImage, prompt);
-      setEditedResult(result);
+      setEditedResults(prev => [...prev, {...result, prompt: prompt}]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "An unknown error occurred.");
     } finally {
@@ -95,16 +150,11 @@ const App: React.FC = () => {
         {!originalImage ? (
           <ImageUploader onImageUpload={handleImageUpload} setAppError={setError} />
         ) : (
-          <div className="max-w-4xl mx-auto">
+          <div className="max-w-5xl mx-auto">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
               <ImageCard title="Original" imageUrl={originalImage.dataUrl} />
-              {editedResult ? (
-                 <ImageCard title="Edited" imageUrl={editedResult.imageUrl} />
-              ) : (
-                <ResultPlaceholder isLoading={isLoading} text={editedResult?.text}/>
-              )}
+              <ResultsPanel results={editedResults} isLoading={isLoading} />
             </div>
-             {editedResult?.text && <p className="text-center text-medium-text italic mb-6 p-4 bg-dark-card border border-dark-border rounded-lg">{editedResult.text}</p>}
 
             <div className="bg-dark-card border border-dark-border rounded-lg p-4 space-y-4">
               <textarea
@@ -115,19 +165,27 @@ const App: React.FC = () => {
                 rows={3}
                 disabled={isLoading}
               />
-              <div className="flex flex-col sm:flex-row gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 <button
                   onClick={handleSubmit}
-                  disabled={isLoading || !prompt.trim()}
-                  className="w-full flex items-center justify-center px-6 py-3 bg-brand-primary text-white font-semibold rounded-md hover:bg-brand-secondary focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-dark-card focus:ring-brand-primary transition duration-200 disabled:bg-gray-500 disabled:cursor-not-allowed"
+                  disabled={isLoading || !prompt.trim() || !!getInitializationError()}
+                  className="w-full flex items-center justify-center px-6 py-3 bg-brand-primary text-white font-semibold rounded-md hover:bg-brand-secondary focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-dark-card focus:ring-brand-primary transition duration-200 disabled:bg-gray-500 disabled:cursor-not-allowed lg:col-span-1"
                 >
                   <WandIcon />
                   {isLoading ? 'Generating...' : 'Generate Edit'}
                 </button>
+                 <button
+                  onClick={handleDownloadAll}
+                  disabled={isLoading || editedResults.length === 0}
+                  className="w-full flex items-center justify-center px-6 py-3 bg-green-600 text-white font-semibold rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-dark-card focus:ring-green-500 transition duration-200 disabled:bg-gray-500 disabled:cursor-not-allowed"
+                >
+                  <DownloadIcon />
+                  Download All as ZIP
+                </button>
                 <button
                   onClick={handleNewUpload}
                   disabled={isLoading}
-                  className="w-full sm:w-auto px-6 py-3 bg-dark-border text-light-text font-semibold rounded-md hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-dark-card focus:ring-gray-500 transition duration-200 disabled:opacity-50"
+                  className="w-full px-6 py-3 bg-dark-border text-light-text font-semibold rounded-md hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-dark-card focus:ring-gray-500 transition duration-200 disabled:opacity-50"
                 >
                   Upload New Image
                 </button>
